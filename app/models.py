@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import date, datetime
 from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -479,3 +480,122 @@ class ConflictAuditResponse(BaseModel):
     max_hops: int
     # 按稿件 ID 排序
     audits: list[ManuscriptAuditOut]
+
+
+# ---------- POST /review-clock：评审工时钟重放 ----------
+
+# 工时钟事件：接受 / 暂停 / 恢复 / 提交
+ClockEventType = Literal["accept", "pause", "resume", "submit"]
+# 工时钟状态：待接受 / 计时中 / 已暂停 / 已提交
+ClockStatus = Literal["pending", "active", "paused", "submitted"]
+ClockIssueType = Literal[
+    "duplicate_pair",
+    "unknown_pair",
+    "duplicate_event",
+    "invalid_transition",
+]
+# 工时（小时）：整小时为整数，不足整小时给出至多 6 位小数（始终是 5 秒的倍数）
+WorkHours = int | float
+
+
+class ReviewClockPairIn(BaseModel):
+    """一对由 /assign 名单形成的「稿件—评审人」配对及其工作小时预算。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    manuscript_id: str = Field(min_length=1, max_length=128, description="稿件 ID")
+    reviewer_id: str = Field(min_length=1, max_length=128, description="评审人 ID")
+    budget_hours: int = Field(
+        ge=1, le=100000,
+        description="该对评审工作的正整数小时预算（仅工作时段累计）",
+    )
+
+
+class ReviewClockEventIn(BaseModel):
+    """一条配对状态事件（UTC 时刻）。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    manuscript_id: str = Field(min_length=1, max_length=128, description="稿件 ID")
+    reviewer_id: str = Field(min_length=1, max_length=128, description="评审人 ID")
+    type: ClockEventType = Field(
+        description="事件类型：accept（接受）/ pause（暂停）/ resume（恢复）/ submit（提交）",
+    )
+    at: datetime = Field(
+        description=(
+            "事件发生的 UTC 时刻（建议以 Z 结尾的 ISO 8601；"
+            "不带时区偏移的日期时间按 UTC 解释）"
+        ),
+    )
+
+
+class ReviewClockRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    pairs: list[ReviewClockPairIn] = Field(
+        min_length=1, max_length=10000,
+        description=(
+            "由 /assign 名单形成的稿件—评审人配对及每对正整数工作小时预算；"
+            "同一配对重复出现将被拒绝（duplicate_pair）"
+        ),
+    )
+    events: list[ReviewClockEventIn] = Field(
+        default_factory=list, max_length=100000,
+        description=(
+            "配对状态事件列表（accept / pause / resume / submit），按各事件 "
+            "at 时间重放；晚于 query_at 的事件整段忽略"
+        ),
+    )
+    holidays: list[date] = Field(
+        default_factory=list, max_length=3660,
+        description=(
+            "节假日日期列表（整日不计工作时间，按 UTC 日期；重复日期自动去重）"
+        ),
+    )
+    query_at: datetime = Field(
+        description=(
+            "查询时刻（UTC；建议以 Z 结尾的 ISO 8601，naive 日期时间按 UTC 解释）："
+            "仅重放不晚于该时刻的事件，钟面结果为该时刻的快照"
+        ),
+    )
+
+
+class ClockIssueOut(BaseModel):
+    """一条拒绝原因（整体 422 时返回全部问题，不输出任何钟结果）。"""
+
+    type: ClockIssueType
+    manuscript_id: str | None = None
+    reviewer_id: str | None = None
+    # 仅事件类问题（duplicate_event / invalid_transition / unknown_pair）携带
+    event_type: ClockEventType | None = None
+    at: datetime | None = None
+    detail: str
+
+
+class ReviewClockPairOut(BaseModel):
+    """一个配对在查询时刻的钟面快照（按稿件、评审人 ID 排序）。"""
+
+    manuscript_id: str
+    reviewer_id: str
+    status: ClockStatus
+    # 已累计的工作小时数（仅工作时段；整小时为整数，否则至多 6 位小数）
+    worked_hours: WorkHours
+    # 剩余工作小时数（预算 - 已用；提交逾期时可能为负）
+    remaining_hours: WorkHours
+    # 预计截止 UTC 时刻；pending / paused 时为 null
+    deadline: datetime | None
+    # 是否逾期：计时中按查询时刻 vs 截止时刻；提交后按提交时刻判定
+    overdue: bool
+
+
+class ReviewClockResponse(BaseModel):
+    query_at: datetime
+    holidays: list[date]
+    # 按 (manuscript_id, reviewer_id) 排序
+    clocks: list[ReviewClockPairOut]
+
+
+class ReviewClockError(BaseModel):
+    """请求被拒绝（422）：结构化问题清单，clocks 不输出。"""
+
+    errors: list[ClockIssueOut]

@@ -55,23 +55,35 @@
 按完整 ID 序列字典序选取。响应按 ID 排序，分别列出每个稿件的合格评审人与不合格配对
 的全部原因；主题不匹配不属于利益冲突，以 `topic_mismatch` 单独标记。
 
+`POST /review-clock` 提供**评审工时钟重放**：对 `/assign` 名单形成的稿件—评审人配对，
+携带每对正整数工作小时预算与按 UTC 时间记录的状态事件（`accept` 接受、`pause` 暂停、
+`resume` 恢复、`submit` 提交）以及节假日日期，服务按事件时间重放每对的状态机，
+**只在周一至周五 09:00—17:00 UTC 且非节假日**累计工作时长；暂停期间停止计时，
+跨下班、周末与节假日自动顺延。响应给出各对当前状态、已用/剩余工作时长、预计截止
+UTC 时刻与是否逾期（暂停中截止时刻为空，提交后按提交时刻判定逾期），结果按稿件与
+评审人 ID 排序。重复配对、未知配对、同对同刻事件与非法状态转换一律返回 `422` 与
+结构化问题清单，不输出任何钟结果。
+
 ## 快速启动（单条命令）
 
 ```bash
 docker compose up --build
 ```
 
-依赖安装与初始化全部在镜像构建与容器启动时完成，无需任何额外步骤。
+依赖安装与初始化全部在镜像构建与容器启动时完成，无需任何额外步骤；启动后浏览器或
+curl 直接访问 <http://localhost:8000> 即可（根路径返回服务信息）。
 
 启动后访问：
 
 | 地址 | 说明 |
 | --- | --- |
+| http://localhost:8000/ | 服务信息（接口与文档入口） |
 | http://localhost:8000/health | 健康检查 |
 | http://localhost:8000/assign | 分配接口（POST） |
 | http://localhost:8000/assign-coverage | 评审人下限覆盖分配接口（POST） |
 | http://localhost:8000/assign-roles | 分角色分配接口（POST） |
 | http://localhost:8000/conflict-audit | 资格审计接口（POST，只读） |
+| http://localhost:8000/review-clock | 评审工时钟重放接口（POST） |
 | http://localhost:8000/docs | Swagger 交互式文档 |
 | http://localhost:8000/redoc | ReDoc 文档 |
 
@@ -832,6 +844,152 @@ docker run -p 8000:8000 review-assign
 | `ineligible_pairs[].collaboration_path` | 合作链冲突时的最短人员路径 `[评审人, ..., 作者]`；无合作链冲突时为 `null` |
 | `ineligible_pairs[].hops` | 最短合作链跳数（`len(collaboration_path) - 1`）；无合作链冲突时为 `null` |
 
+### `POST /review-clock`（评审工时钟重放）
+
+对 `/assign` 名单形成的**稿件—评审人配对**，携带每对正整数**工作小时预算**与按
+UTC 时间记录的状态事件，服务按事件时间逐对重放状态机，并按统一工作日历累计工时。
+接口本身不做分配计算（名单由调用方从 `/assign` 响应取得），服务无状态。
+
+**工作日历（UTC）**：周一至周五 `09:00—17:00` 为工作时段（每个工作日 8 小时），
+请求给出的 `holidays` 节假日整日不计工时；计时只累计落在工作时段内的时间，
+跨下班、周末与节假日自动顺延、不消耗预算。
+
+**状态机**：
+
+```
+pending ──accept──▶ active ──pause──▶ paused ──resume──▶ active
+                       │                  │
+                       └────submit───────▶ submitted（终态；paused 不能直接提交）
+```
+
+- `pending`（待接受）：尚无事件；工时为 0、无截止时刻。
+- `active`（计时中）：`accept` / `resume` 后开始累计工时。
+- `paused`（已暂停）：`pause` 后停止计时，工时冻结，**截止时刻为 `null`**；
+  `resume` 后以恢复时刻与当时剩余预算重新投影截止时刻。
+- `submitted`（已提交）：终态；工时与截止判定**冻结在提交时刻**——
+  提交时刻晚于截止时刻（等价于累计工时超过预算）即 `overdue: true`，
+  与查询时刻早晚无关。
+
+请求体：
+
+```json
+{
+  "pairs": [
+    {"manuscript_id": "m1", "reviewer_id": "r1", "budget_hours": 10},
+    {"manuscript_id": "m1", "reviewer_id": "r2", "budget_hours": 8}
+  ],
+  "events": [
+    {"manuscript_id": "m1", "reviewer_id": "r1", "type": "accept",
+     "at": "2026-09-21T10:00:00Z"},
+    {"manuscript_id": "m1", "reviewer_id": "r1", "type": "pause",
+     "at": "2026-09-21T12:00:00Z"},
+    {"manuscript_id": "m1", "reviewer_id": "r1", "type": "resume",
+     "at": "2026-09-22T10:00:00Z"},
+    {"manuscript_id": "m1", "reviewer_id": "r2", "type": "accept",
+     "at": "2026-09-21T08:00:00Z"}
+  ],
+  "holidays": ["2026-09-23"],
+  "query_at": "2026-09-22T11:00:00Z"
+}
+```
+
+字段规则：
+
+- `pairs`（必填，至少 1 对）：由 `/assign` 名单形成的配对；同一
+  `(manuscript_id, reviewer_id)` 重复出现返回 `422`（`duplicate_pair`）。
+  `budget_hours` 为正整数工作小时预算（1～100000）。
+- `events`（可选，缺省为空）：元素为 `{manuscript_id, reviewer_id, type, at}`；
+  `type` 取值 `accept` / `pause` / `resume` / `submit`，`at` 为 UTC 时刻
+  （建议以 `Z` 结尾的 ISO 8601；不带时区偏移的日期时间按 UTC 解释）。事件
+  **无需按时间排序**，服务按 `at` 重放，输入顺序不影响结果。
+- `holidays`（可选，缺省为空）：`YYYY-MM-DD` 日期列表，按 UTC 日期整日排除，
+  重复日期自动去重。
+- `query_at`（必填）：查询时刻（UTC）。仅重放 `at <= query_at` 的事件；
+  之后的事件整段忽略（既不改变状态也不参与校验），钟面为该时刻的快照。
+- 校验问题（均返回 `422`，见下表）可一次返回多条，按类型与 ID 确定性排序，
+  此时不输出任何钟结果：
+
+| 问题类型 | 含义 |
+| --- | --- |
+| `duplicate_pair` | `pairs` 中同一配对重复出现 |
+| `unknown_pair` | 事件引用了未在 `pairs` 中声明的配对 |
+| `duplicate_event` | 同一配对在同一 UTC 时刻有两条及以上事件（与事件类型是否相同无关） |
+| `invalid_transition` | 事件在当前状态下非法（如未接受先暂停、暂停中直接提交、提交后再来事件） |
+
+非法事件在重放中跳过（其后的合法事件照常重放），所有问题收集后一并返回。
+
+可行时响应（`200`）：`clocks` 按 `(manuscript_id, reviewer_id)` 排序。工时以小时
+给出：整小时为整数（如 `2`），不足整小时为至多 6 位小数的数（5 秒精度，如
+`0.001389`）；`remaining_hours = budget_hours - worked_hours`，逾期未提交时
+可能为负。`deadline` 为 ISO 8601 UTC 时刻（`Z` 结尾）。
+
+```json
+{
+  "query_at": "2026-09-22T11:00:00Z",
+  "holidays": ["2026-09-23"],
+  "clocks": [
+    {
+      "manuscript_id": "m1",
+      "reviewer_id": "r1",
+      "status": "active",
+      "worked_hours": 3,
+      "remaining_hours": 7,
+      "deadline": "2026-09-24T10:00:00Z",
+      "overdue": false
+    },
+    {
+      "manuscript_id": "m1",
+      "reviewer_id": "r2",
+      "status": "active",
+      "worked_hours": 10,
+      "remaining_hours": -2,
+      "deadline": "2026-09-21T17:00:00Z",
+      "overdue": true
+    }
+  ]
+}
+```
+
+上例说明：
+
+- `m1/r1`：周一 10:00—12:00 工作 2h 后暂停（暂停不计工时），周二 10:00 恢复，
+  至查询时刻 11:00 共工作 3h；恢复时剩余 8h，预算投影跨周二（7h）后到周四
+  （周三为节假日）10:00，故 `deadline = 2026-09-24T10:00:00Z`。
+- `m1/r2`：周一 08:00（上班前）接受，计时从 09:00 起，当天 8h 用满预算，
+  截止为周一 17:00；查询时已工作 10h（周一 8h + 周二 2h），`overdue: true`，
+  剩余为 -2h。
+
+被拒绝时响应（`422`，与请求体字段错误的 FastAPI 校验响应同为 422，但本结构为
+`errors` 数组）：
+
+```json
+{
+  "errors": [
+    {
+      "type": "invalid_transition",
+      "manuscript_id": "m1",
+      "reviewer_id": "r1",
+      "event_type": "pause",
+      "at": "2026-09-21T10:00:00Z",
+      "detail": "配对 m1 -> r1 在 2026-09-21T10:00:00+00:00 的 pause 事件非法：当前状态为 pending，仅允许：accept"
+    }
+  ]
+}
+```
+
+逾期判定细则：
+
+| 状态 | 截止时刻 | 逾期判定 |
+| --- | --- | --- |
+| `pending` | `null` | `false` |
+| `active` | 进入当前计时段（accept/resume）时按当时剩余预算投影 | `query_at > deadline` |
+| `paused` | `null`（无法预计恢复时间） | `false` |
+| `submitted` | 最后一个计时段的投影（冻结） | 提交时刻 `> deadline`，即提交时累计工时超过预算 |
+
+截止时刻恰等于查询/提交时刻时**不算逾期**。接受事件落在非工作时刻（上班前、
+下班后、周末或节假日）时，计时段起点钳制到其后第一个工作瞬间（通常为当天/次一
+工作日 09:00）。
+
 ### 示例调用
 
 ```bash
@@ -973,6 +1131,27 @@ curl -s -X POST http://localhost:8000/conflict-audit \
 # -> m1 的合格评审人为 r1；r2 显式回避 m1 且主题不匹配；
 #    r3 经 2 跳合作链 r3 -> x -> alice 关联作者，collaboration_path 给出最短路径；
 #    m2 无任何评审人主题匹配（r1/r2/r3 均仅 topic_mismatch=true，reasons 为空）
+
+# 评审工时钟：按 UTC 事件重放，仅工作日 09:00-17:00 计工时，节假日与周末顺延
+curl -s -X POST http://localhost:8000/review-clock \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "pairs": [
+          {"manuscript_id": "m1", "reviewer_id": "r1", "budget_hours": 10}
+        ],
+        "events": [
+          {"manuscript_id": "m1", "reviewer_id": "r1", "type": "accept",
+           "at": "2026-09-21T10:00:00Z"},
+          {"manuscript_id": "m1", "reviewer_id": "r1", "type": "pause",
+           "at": "2026-09-21T12:00:00Z"},
+          {"manuscript_id": "m1", "reviewer_id": "r1", "type": "resume",
+           "at": "2026-09-22T10:00:00Z"}
+        ],
+        "holidays": ["2026-09-23"],
+        "query_at": "2026-09-22T11:00:00Z"
+      }'
+# -> status=active，worked_hours=3（周一 2h + 周二 1h，暂停与夜间不计）；
+#    恢复时剩 8h，周二计 7h 后跨节假日（周三）顺延，deadline=2026-09-24T10:00:00Z
 ```
 
 ## 算法与确定性
@@ -1027,6 +1206,17 @@ curl -s -X POST http://localhost:8000/conflict-audit \
   重复边、反向边与自环一律忽略，全部节点与列表均按 ID 排序处理，相同业务输入
   （含不同列表顺序）产生逐字节相同的审计结果。审计接口无状态、不涉及任何流量
   求解或分配结果，`capacity` 等容量字段不参与资格判定。
+- 工时钟重放（`/review-clock`）：每对配对独立维护
+  `pending → active ⇄ paused → submitted` 状态机，事件按 `(at, 输入下标)`
+  稳定排序后仅重放 `at <= query_at` 者；工时以整数秒累计——计时段
+  （accept/resume 到 pause/submit 或 query_at）与工作日工作时段
+  （周一至周五 UTC 09:00—17:00，扣除 `holidays` 整日）逐日求区间交集，
+  非工作时间与暂停期间一律不计时；预计截止时刻在每次进入计时段时由
+  「该段起点 + 当时剩余工时」逐日扫描工作时段投影得到（非工作起点先钳制到其后
+  第一个工作瞬间），故暂停清空截止、恢复重新投影，且计时中查询时刻推进不会
+  移动截止时刻；提交后工时、截止时刻与逾期判定冻结在提交时刻。重复配对、
+  未知配对、同对同刻事件与非法状态转换收集为确定性排序的问题清单整体拒绝；
+  计算全程整数秒、无时区与浮点歧义，相同事件集合（含乱序输入）结果完全相同。
 - 所有节点按 ID 排序后建图，BFS / Dijkstra 均按固定邻接顺序与 (费用, 节点下标) 字典序
   执行，算法无随机性：相同输入（含不同的列表顺序）产生逐字节相同的输出，
   同成本解由 ID 顺序确定性地破除（瓶颈割的节点与边同样按业务 ID 确定排序）。
@@ -1044,15 +1234,17 @@ uvicorn app.main:app --reload --port 8000   # 本地起服务
 
 ```
 app/
-  main.py      # FastAPI 入口：/health、/assign、/assign-coverage、/assign-roles、/conflict-audit
+  main.py      # FastAPI 入口：/health、/assign、/assign-coverage、/assign-roles、/conflict-audit、/review-clock
   models.py    # 请求/响应模型与校验
   solver.py    # 分配求解器：普通模式全局最大流 + 增量模式最小费用最大流 + 负载均衡字典序优化 + 下限覆盖带下界流 + 分角色全局分配
   audit.py     # 资格审计：自稿/显式回避/主题匹配 + 无向合作图最短链（BFS 分层 + 完整 ID 序列字典序破同）
+  clock.py     # 工时钟重放：工作日历（工作日 09:00-17:00 UTC、节假日排除）整数秒计时 + 状态机重放与截止时刻投影
 tests/
   test_assign.py          # /assign 端到端测试
   test_assign_coverage.py # /assign-coverage 端到端测试
   test_assign_roles.py    # /assign-roles 端到端测试
   test_conflict_audit.py  # /conflict-audit 端到端测试
+  test_review_clock.py    # /review-clock 端到端测试
 Dockerfile
 docker-compose.yml
 requirements.txt

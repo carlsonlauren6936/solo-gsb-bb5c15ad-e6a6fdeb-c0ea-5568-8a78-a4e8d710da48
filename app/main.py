@@ -3,7 +3,14 @@
 from __future__ import annotations
 
 from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 
+from .clock import (
+    ClockEvent as ClockEventSpec,
+    ClockIssue,
+    ClockPair as ClockPairSpec,
+    replay_clocks,
+)
 from .models import (
     AssignmentIn,
     AssignmentOut,
@@ -11,6 +18,7 @@ from .models import (
     AssignResponse,
     BottleneckCutEdgeOut,
     BottleneckCutOut,
+    ClockIssueOut,
     ConflictAuditRequest,
     ConflictAuditResponse,
     CoverageAssignRequest,
@@ -21,6 +29,10 @@ from .models import (
     LockedConflictOut,
     ManuscriptAuditOut,
     ManuscriptRolesOut,
+    ReviewClockError,
+    ReviewClockPairOut,
+    ReviewClockRequest,
+    ReviewClockResponse,
     ReviewerShortfallOut,
     RoleAssignRequest,
     RoleAssignResponse,
@@ -42,7 +54,7 @@ from .solver import (
 
 app = FastAPI(
     title="Anonymous Review Assignment API",
-    version="1.7.0",
+    version="1.8.0",
     description=(
         "匿名评审分配服务：基于全局最大流（非逐稿贪心）求满足主题能力、"
         "利益冲突与容量约束的完整分配；不可行时返回缺口诊断与全局最小割证明"
@@ -69,6 +81,10 @@ app = FastAPI(
         "与最大链长 max_hops（1～6），评审人到稿件任一作者存在不超过 max_hops "
         "跳的合作链时判为合作链利益冲突，返回按完整 ID 序列字典序选取的最短"
         "人员路径；审计只判定资格，不改动任何现有分配结果。"
+        "支持评审工时钟重放（POST /review-clock）：对 /assign 名单形成的稿件—"
+        "评审人配对，按 UTC 事件（接受、暂停、恢复、提交）重放状态机，只在"
+        "周一至周五 09:00—17:00 UTC 且非节假日累计工作时长，返回各对状态、"
+        "已用/剩余工时、预计截止时刻与逾期判定。"
         "服务无状态，不持久化任何稿件/评审信息。"
     ),
 )
@@ -416,5 +432,77 @@ def conflict_audit(req: ConflictAuditRequest) -> ConflictAuditResponse:
                 ],
             )
             for a in result.audits
+        ],
+    )
+
+
+def _hours(seconds: int) -> int | float:
+    """整秒 -> 小时数：整小时返回 int，否则至多 6 位小数（5 秒精度）。"""
+    if seconds % 3600 == 0:
+        return seconds // 3600
+    return round(seconds / 3600, 6)
+
+
+def _clock_issue_out(issue: ClockIssue) -> ClockIssueOut:
+    return ClockIssueOut(
+        type=issue.type,
+        manuscript_id=issue.manuscript_id,
+        reviewer_id=issue.reviewer_id,
+        event_type=issue.event_type,
+        at=issue.at,
+        detail=issue.detail,
+    )
+
+
+@app.post(
+    "/review-clock",
+    response_model=ReviewClockResponse,
+    tags=["review-clock"],
+    responses={422: {"model": ReviewClockError}},
+)
+def review_clock(req: ReviewClockRequest):
+    holidays = frozenset(req.holidays)  # 重复日期自动去重
+    pairs = [
+        ClockPairSpec(
+            manuscript_id=p.manuscript_id,
+            reviewer_id=p.reviewer_id,
+            budget_hours=p.budget_hours,
+        )
+        for p in req.pairs
+    ]
+    events = [
+        ClockEventSpec(
+            manuscript_id=e.manuscript_id,
+            reviewer_id=e.reviewer_id,
+            type=e.type,
+            at=e.at,
+        )
+        for e in req.events
+    ]
+
+    replay = replay_clocks(pairs, events, holidays, req.query_at)
+    if replay.issues:
+        # 重复配对 / 未知配对 / 同对同刻事件 / 非法状态转换：整体拒绝，不输出钟结果
+        return JSONResponse(
+            status_code=422,
+            content=ReviewClockError(
+                errors=[_clock_issue_out(i) for i in replay.issues]
+            ).model_dump(mode="json"),
+        )
+
+    return ReviewClockResponse(
+        query_at=req.query_at,
+        holidays=sorted(holidays),
+        clocks=[
+            ReviewClockPairOut(
+                manuscript_id=c.manuscript_id,
+                reviewer_id=c.reviewer_id,
+                status=c.status,
+                worked_hours=_hours(c.worked_seconds),
+                remaining_hours=_hours(c.remaining_seconds),
+                deadline=c.deadline,
+                overdue=c.overdue,
+            )
+            for c in replay.results
         ],
     )
