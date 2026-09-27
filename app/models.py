@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import date, datetime
 from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -479,3 +480,111 @@ class ConflictAuditResponse(BaseModel):
     max_hops: int
     # 按稿件 ID 排序
     audits: list[ManuscriptAuditOut]
+
+
+# ---------- POST /review-clock：评审工时时钟 ----------
+
+# 事件类型：接受 / 暂停 / 恢复 / 提交
+ReviewEventType = Literal["accept", "pause", "resume", "submit"]
+
+
+class ReviewPairIn(BaseModel):
+    """一个「稿件—评审人」配对及其工作小时预算。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    manuscript_id: str = Field(min_length=1, max_length=128, description="稿件 ID")
+    reviewer_id: str = Field(min_length=1, max_length=128, description="评审人 ID")
+    budget_work_hours: int = Field(
+        ge=1, le=100000,
+        description="该配对的评审工作小时预算（正整数，按工作时长累计）",
+    )
+
+
+class ReviewEventIn(BaseModel):
+    """一条 UTC 事件：接受 / 暂停 / 恢复 / 提交。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    manuscript_id: str = Field(min_length=1, max_length=128, description="稿件 ID")
+    reviewer_id: str = Field(min_length=1, max_length=128, description="评审人 ID")
+    type: ReviewEventType = Field(
+        description="事件类型：accept（接受）/ pause（暂停）/ resume（恢复）/ submit（提交）"
+    )
+    at: datetime = Field(
+        description="事件发生的 UTC 时刻（ISO 8601；无时区信息时按 UTC 解释）"
+    )
+
+
+class ReviewClockRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    pairs: list[ReviewPairIn] = Field(
+        max_length=10000,
+        description="稿件—评审人配对及每对的正整数工作小时预算（配对不可重复）",
+    )
+    events: list[ReviewEventIn] = Field(
+        default_factory=list, max_length=100000,
+        description=(
+            "UTC 事件流（接受 / 暂停 / 恢复 / 提交）；按配对分组后沿时刻重放，"
+            "输入顺序不影响结果；查询时刻之后的事件不参与状态计算但仍参与合法性校验"
+        ),
+    )
+    holidays: list[date] = Field(
+        default_factory=list, max_length=4000,
+        description="节假日日期（YYYY-MM-DD）；节假日与周末一样不计工作时长",
+    )
+    query_at: datetime = Field(
+        description="查询时刻（UTC）：报告该时刻各配对的状态与工时"
+    )
+
+    @model_validator(mode="after")
+    def _check_pairs_and_events(self) -> "ReviewClockRequest":
+        seen: set[tuple[str, str]] = set()
+        for p in self.pairs:
+            key = (p.manuscript_id, p.reviewer_id)
+            if key in seen:
+                raise ValueError(
+                    f"重复配对：稿件 {p.manuscript_id} 与评审人 {p.reviewer_id}"
+                )
+            seen.add(key)
+        instants: set[tuple[str, str, datetime]] = set()
+        for e in self.events:
+            key = (e.manuscript_id, e.reviewer_id)
+            if key not in seen:
+                raise ValueError(
+                    f"事件引用了未声明的配对：稿件 {e.manuscript_id} / 评审人 {e.reviewer_id}"
+                )
+            # 感知时刻按瞬间比较：不同时区表示的同一时刻同样判重
+            inst_key = (e.manuscript_id, e.reviewer_id, e.at)
+            if inst_key in instants:
+                raise ValueError(
+                    f"配对 ({e.manuscript_id}, {e.reviewer_id}) 在同一时刻存在多个事件"
+                )
+            instants.add(inst_key)
+        return self
+
+
+class ReviewClockPairOut(BaseModel):
+    """查询时刻单个配对的状态与工时报告。"""
+
+    manuscript_id: str
+    reviewer_id: str
+    # pending（未接受）/ active（计时中）/ paused（已暂停）/ submitted（已提交）
+    status: Literal["pending", "active", "paused", "submitted"]
+    budget_work_hours: int
+    # 查询时刻（submitted 为提交时刻）已累计的工作时长（秒）
+    used_work_seconds: int
+    # max(0, 预算 - 已用)，单位秒
+    remaining_work_seconds: int
+    # 预计截止 UTC 时刻；仅 active 状态非空（已超预算时为过去某刻）
+    deadline_at: datetime | None
+    # 已用工作时长 > 预算；submitted 按提交时刻判定
+    overdue: bool
+
+
+class ReviewClockResponse(BaseModel):
+    # 归一到 UTC 的查询时刻
+    query_at: datetime
+    # 按 (稿件 ID, 评审人 ID) 排序
+    results: list[ReviewClockPairOut]

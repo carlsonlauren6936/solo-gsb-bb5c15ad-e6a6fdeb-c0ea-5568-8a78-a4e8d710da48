@@ -55,6 +55,14 @@
 按完整 ID 序列字典序选取。响应按 ID 排序，分别列出每个稿件的合格评审人与不合格配对
 的全部原因；主题不匹配不属于利益冲突，以 `topic_mismatch` 单独标记。
 
+`POST /review-clock` 提供**评审工时时钟**：对 `/assign` 名单形成的「稿件—评审人」
+配对按**正整数工作小时预算**跟踪工时。UTC 事件流（接受 `accept` / 暂停 `pause` /
+恢复 `resume` / 提交 `submit`）按时刻逐对重放推进状态机；只在
+**周一至周五 09:00—17:00 UTC 且非节假日**累计工作时长，暂停期间停止计时，
+跨下班、周末与节假日自动顺延。重复配对、同对同刻事件与非法状态转换拒绝为 `422`；
+响应返回各配对状态、已用 / 剩余工作时长、预计截止 UTC 时刻（暂停时为空）与是否逾期
+（提交后按提交时刻判定），结果按稿件与评审人 ID 排序。
+
 ## 快速启动（单条命令）
 
 ```bash
@@ -72,6 +80,7 @@ docker compose up --build
 | http://localhost:8000/assign-coverage | 评审人下限覆盖分配接口（POST） |
 | http://localhost:8000/assign-roles | 分角色分配接口（POST） |
 | http://localhost:8000/conflict-audit | 资格审计接口（POST，只读） |
+| http://localhost:8000/review-clock | 评审工时时钟接口（POST） |
 | http://localhost:8000/docs | Swagger 交互式文档 |
 | http://localhost:8000/redoc | ReDoc 文档 |
 
@@ -832,6 +841,119 @@ docker run -p 8000:8000 review-assign
 | `ineligible_pairs[].collaboration_path` | 合作链冲突时的最短人员路径 `[评审人, ..., 作者]`；无合作链冲突时为 `null` |
 | `ineligible_pairs[].hops` | 最短合作链跳数（`len(collaboration_path) - 1`）；无合作链冲突时为 `null` |
 
+### `POST /review-clock`（评审工时时钟）
+
+对 `/assign` 名单形成的「稿件—评审人」配对跟踪评审工时：每个配对声明**正整数
+工作小时预算**，UTC 事件流按时刻逐对重放推进状态机；只在
+**周一至周五 09:00—17:00 UTC 且非节假日**的窗口内累计工作时长，暂停期间停止
+计时，跨下班、周末与节假日自动顺延到下一个工作窗口。
+
+配对状态机（事件按时刻排序后重放，**全部事件**都参与合法性校验）：
+
+```
+pending --accept--> active --pause--> paused --resume--> active
+active  --submit--> submitted（终态，不再接受任何事件）
+```
+
+请求体：
+
+```json
+{
+  "pairs": [
+    {"manuscript_id": "m1", "reviewer_id": "r1", "budget_work_hours": 10},
+    {"manuscript_id": "m1", "reviewer_id": "r2", "budget_work_hours": 10},
+    {"manuscript_id": "m2", "reviewer_id": "r1", "budget_work_hours": 4}
+  ],
+  "events": [
+    {"manuscript_id": "m1", "reviewer_id": "r1", "type": "accept", "at": "2026-09-25T16:00:00Z"},
+    {"manuscript_id": "m1", "reviewer_id": "r2", "type": "accept", "at": "2026-09-25T16:00:00Z"},
+    {"manuscript_id": "m1", "reviewer_id": "r2", "type": "pause",  "at": "2026-09-28T11:00:00Z"},
+    {"manuscript_id": "m2", "reviewer_id": "r1", "type": "accept", "at": "2026-09-21T09:00:00Z"},
+    {"manuscript_id": "m2", "reviewer_id": "r1", "type": "submit", "at": "2026-09-22T10:00:00Z"}
+  ],
+  "holidays": ["2026-09-29"],
+  "query_at": "2026-09-28T12:00:00Z"
+}
+```
+
+字段规则：
+
+- `pairs`（必填）：配对及预算列表。`budget_work_hours` 为**正整数**工作小时预算；
+  同一（`manuscript_id`, `reviewer_id`）配对重复出现返回 `422`。
+- `events`（可选，缺省为空）：UTC 事件流，`type` 取 `accept` / `pause` / `resume` /
+  `submit`，`at` 为 ISO 8601 时刻（无时区信息时按 UTC 解释；带时区偏移的时刻按
+  瞬间归一到 UTC）。事件按配对分组后沿时刻重放，**输入顺序不影响结果**；
+  `query_at` 之后的事件不参与状态计算，但仍参与合法性校验（事件日志整体必须自洽）。
+- `holidays`（可选，缺省为空）：节假日日期（`YYYY-MM-DD`），与周末一样不计工作
+  时长；重复与乱序不影响结果。
+- `query_at`（必填）：查询时刻（UTC），报告该时刻各配对的状态与工时。
+
+以下情形返回 `422`（请求非法，不产出任何结果）：
+
+| 情形 | 说明 |
+| --- | --- |
+| 重复配对 | 同一（稿件, 评审人）配对声明多次 |
+| 同对同刻事件 | 同一配对在同一时刻存在多个事件（不同时区表示的同一瞬间也算） |
+| 非法状态转换 | 不满足状态机的事件（如未接受先暂停、暂停中提交、提交后再有事件） |
+| 未知配对事件 | 事件引用了未在 `pairs` 中声明的配对 |
+
+响应（`200`）：`results` 按（稿件 ID, 评审人 ID）排序；相同输入（含事件乱序、
+节假日重复乱序）必然产生完全相同的输出：
+
+```json
+{
+  "query_at": "2026-09-28T12:00:00Z",
+  "results": [
+    {
+      "manuscript_id": "m1",
+      "reviewer_id": "r1",
+      "status": "active",
+      "budget_work_hours": 10,
+      "used_work_seconds": 14400,
+      "remaining_work_seconds": 21600,
+      "deadline_at": "2026-09-30T10:00:00Z",
+      "overdue": false
+    },
+    {
+      "manuscript_id": "m1",
+      "reviewer_id": "r2",
+      "status": "paused",
+      "budget_work_hours": 10,
+      "used_work_seconds": 10800,
+      "remaining_work_seconds": 25200,
+      "deadline_at": null,
+      "overdue": false
+    },
+    {
+      "manuscript_id": "m2",
+      "reviewer_id": "r1",
+      "status": "submitted",
+      "budget_work_hours": 4,
+      "used_work_seconds": 32400,
+      "remaining_work_seconds": 0,
+      "deadline_at": null,
+      "overdue": true
+    }
+  ]
+}
+```
+
+（`m1->r1`：周五 16:00 接受，已用 4h；剩余 6h 从周一 12:00 起顺延——当天 5h、
+周二为节假日跳过、周三 09:00 起 1h，截止周三 10:00。`m1->r2`：暂停中，截止时刻
+为空。`m2->r1`：提交时刻已用 9h 超出预算 4h，判逾期。）
+
+返回字段含义：
+
+| 字段 | 含义 |
+| --- | --- |
+| `query_at` | 归一到 UTC 的查询时刻 |
+| `results[].status` | 查询时刻状态：`pending`（未接受）/ `active`（计时中）/ `paused`（已暂停）/ `submitted`（已提交） |
+| `results[].budget_work_hours` | 该配对的工作小时预算（与请求一致） |
+| `results[].used_work_seconds` | 查询时刻（`submitted` 为提交时刻）已累计的工作时长（秒） |
+| `results[].remaining_work_seconds` | `max(0, 预算 - 已用)`（秒） |
+| `results[].deadline_at` | 预计截止 UTC 时刻：仅 `active` 状态非空（已超预算时为过去某刻）；`pending` / `paused` / `submitted` 恒为 `null` |
+| `results[].overdue` | 已用工作时长 > 预算；`submitted` 按提交时刻判定（提交后不再变化），`pending` 恒为 `false` |
+
 ### 示例调用
 
 ```bash
@@ -973,6 +1095,29 @@ curl -s -X POST http://localhost:8000/conflict-audit \
 # -> m1 的合格评审人为 r1；r2 显式回避 m1 且主题不匹配；
 #    r3 经 2 跳合作链 r3 -> x -> alice 关联作者，collaboration_path 给出最短路径；
 #    m2 无任何评审人主题匹配（r1/r2/r3 均仅 topic_mismatch=true，reasons 为空）
+
+# 评审工时时钟：按工作小时预算跟踪配对工时，周末与节假日顺延，暂停停表
+curl -s -X POST http://localhost:8000/review-clock \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "pairs": [
+          {"manuscript_id": "m1", "reviewer_id": "r1", "budget_work_hours": 10},
+          {"manuscript_id": "m1", "reviewer_id": "r2", "budget_work_hours": 10},
+          {"manuscript_id": "m2", "reviewer_id": "r1", "budget_work_hours": 4}
+        ],
+        "events": [
+          {"manuscript_id": "m1", "reviewer_id": "r1", "type": "accept", "at": "2026-09-25T16:00:00Z"},
+          {"manuscript_id": "m1", "reviewer_id": "r2", "type": "accept", "at": "2026-09-25T16:00:00Z"},
+          {"manuscript_id": "m1", "reviewer_id": "r2", "type": "pause",  "at": "2026-09-28T11:00:00Z"},
+          {"manuscript_id": "m2", "reviewer_id": "r1", "type": "accept", "at": "2026-09-21T09:00:00Z"},
+          {"manuscript_id": "m2", "reviewer_id": "r1", "type": "submit", "at": "2026-09-22T10:00:00Z"}
+        ],
+        "holidays": ["2026-09-29"],
+        "query_at": "2026-09-28T12:00:00Z"
+      }'
+# -> m1->r1 active：已用 4h，剩余 6h 跨下班与节假日顺延，截止 2026-09-30T10:00:00Z；
+#    m1->r2 paused：已用 3h，deadline_at 为 null；
+#    m2->r1 submitted：提交时刻已用 9h 超出预算 4h，overdue 为 true
 ```
 
 ## 算法与确定性
@@ -1027,6 +1172,16 @@ curl -s -X POST http://localhost:8000/conflict-audit \
   重复边、反向边与自环一律忽略，全部节点与列表均按 ID 排序处理，相同业务输入
   （含不同列表顺序）产生逐字节相同的审计结果。审计接口无状态、不涉及任何流量
   求解或分配结果，`capacity` 等容量字段不参与资格判定。
+- 评审工时时钟（`/review-clock`）：事件按配对分组、按时刻排序后重放状态机
+  （`pending → active ⇄ paused`、`active → submitted`），全部事件（含查询时刻
+  之后的）都参与合法性校验——重复配对、同对同刻事件（按瞬间比较，不同时区
+  表示的同一时刻同样判重）、非法状态转换与未知配对事件一律拒绝为 `422`。
+  工作时长只在周一至周五 `[09:00, 17:00)` UTC 且非节假日的窗口内累计：逐日
+  求计时段与工作窗口的交集（暂停段不计），预计截止时刻从查询时刻（或预算
+  耗尽点）起沿工作窗口逐日前推，跨下班、周末与节假日自动顺延；所有时刻归一到
+  UTC 计算，输出按（稿件 ID, 评审人 ID）排序，相同输入（含事件乱序、节假日
+  重复乱序）产生完全相同的报告。时钟模块独立于分配求解器，不读取也不改动
+  任何分配结果。
 - 所有节点按 ID 排序后建图，BFS / Dijkstra 均按固定邻接顺序与 (费用, 节点下标) 字典序
   执行，算法无随机性：相同输入（含不同的列表顺序）产生逐字节相同的输出，
   同成本解由 ID 顺序确定性地破除（瓶颈割的节点与边同样按业务 ID 确定排序）。
@@ -1044,15 +1199,17 @@ uvicorn app.main:app --reload --port 8000   # 本地起服务
 
 ```
 app/
-  main.py      # FastAPI 入口：/health、/assign、/assign-coverage、/assign-roles、/conflict-audit
+  main.py      # FastAPI 入口：/health、/assign、/assign-coverage、/assign-roles、/conflict-audit、/review-clock
   models.py    # 请求/响应模型与校验
   solver.py    # 分配求解器：普通模式全局最大流 + 增量模式最小费用最大流 + 负载均衡字典序优化 + 下限覆盖带下界流 + 分角色全局分配
   audit.py     # 资格审计：自稿/显式回避/主题匹配 + 无向合作图最短链（BFS 分层 + 完整 ID 序列字典序破同）
+  review_clock.py  # 评审工时时钟：事件重放状态机 + 工作窗口（周一至周五 09:00—17:00 UTC，节假日除外）计时与截止推算
 tests/
   test_assign.py          # /assign 端到端测试
   test_assign_coverage.py # /assign-coverage 端到端测试
   test_assign_roles.py    # /assign-roles 端到端测试
   test_conflict_audit.py  # /conflict-audit 端到端测试
+  test_review_clock.py    # /review-clock 端到端测试
 Dockerfile
 docker-compose.yml
 requirements.txt

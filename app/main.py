@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 
 from .models import (
     AssignmentIn,
@@ -21,6 +21,9 @@ from .models import (
     LockedConflictOut,
     ManuscriptAuditOut,
     ManuscriptRolesOut,
+    ReviewClockPairOut,
+    ReviewClockRequest,
+    ReviewClockResponse,
     ReviewerShortfallOut,
     RoleAssignRequest,
     RoleAssignResponse,
@@ -31,6 +34,13 @@ from .models import (
     WorkloadBalanceOut,
 )
 from .audit import audit_conflicts
+from .review_clock import (
+    ClockEvent,
+    PairSpec,
+    ReviewClockError,
+    as_utc,
+    compute_review_clock,
+)
 from .solver import (
     BottleneckCut,
     ManuscriptSpec,
@@ -42,7 +52,7 @@ from .solver import (
 
 app = FastAPI(
     title="Anonymous Review Assignment API",
-    version="1.7.0",
+    version="1.8.0",
     description=(
         "匿名评审分配服务：基于全局最大流（非逐稿贪心）求满足主题能力、"
         "利益冲突与容量约束的完整分配；不可行时返回缺口诊断与全局最小割证明"
@@ -69,6 +79,13 @@ app = FastAPI(
         "与最大链长 max_hops（1～6），评审人到稿件任一作者存在不超过 max_hops "
         "跳的合作链时判为合作链利益冲突，返回按完整 ID 序列字典序选取的最短"
         "人员路径；审计只判定资格，不改动任何现有分配结果。"
+        "支持评审工时时钟（POST /review-clock）：对 /assign 名单形成的"
+        "稿件—评审人配对按正整数工作小时预算跟踪工时，UTC 事件流（接受 / 暂停 / "
+        "恢复 / 提交）按时刻逐对重放推进状态机，只在周一至周五 09:00—17:00 UTC "
+        "且非节假日累计工作时长，暂停期间停止计时，跨下班、周末与节假日顺延；"
+        "重复配对、同对同刻事件与非法状态转换拒绝为 422；返回各配对状态、已用 / "
+        "剩余工作时长、预计截止 UTC 时刻（暂停时为空）与是否逾期（提交后按提交"
+        "时刻判定），结果按稿件与评审人 ID 排序。"
         "服务无状态，不持久化任何稿件/评审信息。"
     ),
 )
@@ -417,4 +434,33 @@ def conflict_audit(req: ConflictAuditRequest) -> ConflictAuditResponse:
             )
             for a in result.audits
         ],
+    )
+
+
+@app.post("/review-clock", response_model=ReviewClockResponse, tags=["review-clock"])
+def review_clock(req: ReviewClockRequest) -> ReviewClockResponse:
+    # 时钟模块只读取配对 / 事件 / 节假日 / 查询时刻，不涉及任何分配求解
+    try:
+        reports = compute_review_clock(
+            pairs=[
+                PairSpec(
+                    manuscript_id=p.manuscript_id,
+                    reviewer_id=p.reviewer_id,
+                    budget_work_hours=p.budget_work_hours,
+                )
+                for p in req.pairs
+            ],
+            events=[
+                ((e.manuscript_id, e.reviewer_id), ClockEvent(type=e.type, at=e.at))
+                for e in req.events
+            ],
+            holidays=frozenset(req.holidays),
+            query_at=req.query_at,
+        )
+    except ReviewClockError as exc:
+        # 重复配对 / 同对同刻事件 / 非法状态转换 / 事件引用未知配对：请求非法
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return ReviewClockResponse(
+        query_at=as_utc(req.query_at),
+        results=[ReviewClockPairOut(**vars(r)) for r in reports],
     )
